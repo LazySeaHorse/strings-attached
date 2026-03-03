@@ -3,9 +3,10 @@
  * that flows along a catenary curve from its anchor point in the document
  * to the user's cursor.
  *
- * Uses an SVG `<textPath>` on a quadratic bezier with stiff spring physics
- * (slight droop, micro-sway, high damping) so it feels like pulling a
- * thread of text out of the page under tension.
+ * Letters are rendered as individual HTML elements positioned along the
+ * bezier curve — like beads threaded on a string. Each letter stays upright
+ * (no rotation), avoiding the broken tilted-glyph rendering of <textPath>.
+ * A thin SVG stroke path renders the "string" line underneath.
  *
  * Pure DOM — no animation library required.
  */
@@ -37,6 +38,64 @@ const DAMPING = 24;
 const X_STIFFNESS = 400;
 const X_DAMPING = 28;
 
+// ─── Bezier helpers ──────────────────────────────────────────────
+/** Get point on a quadratic bezier at parameter t */
+function quadBezierPoint(
+  ax: number, ay: number,
+  cx: number, cy: number,
+  bx: number, by: number,
+  t: number,
+): { x: number; y: number } {
+  const u = 1 - t;
+  return {
+    x: u * u * ax + 2 * u * t * cx + t * t * bx,
+    y: u * u * ay + 2 * u * t * cy + t * t * by,
+  };
+}
+
+/** Approximate arc length of a quadratic bezier using line segments */
+function quadBezierLength(
+  ax: number, ay: number,
+  cx: number, cy: number,
+  bx: number, by: number,
+  segments = 32,
+): number {
+  let len = 0;
+  let prev = { x: ax, y: ay };
+  for (let i = 1; i <= segments; i++) {
+    const pt = quadBezierPoint(ax, ay, cx, cy, bx, by, i / segments);
+    len += Math.hypot(pt.x - prev.x, pt.y - prev.y);
+    prev = pt;
+  }
+  return len;
+}
+
+/** Find t parameter for a target arc-length distance along the bezier */
+function tAtArcLength(
+  ax: number, ay: number,
+  cx: number, cy: number,
+  bx: number, by: number,
+  targetLen: number,
+  segments = 64,
+): number {
+  let accumulated = 0;
+  let prev = { x: ax, y: ay };
+  for (let i = 1; i <= segments; i++) {
+    const t = i / segments;
+    const pt = quadBezierPoint(ax, ay, cx, cy, bx, by, t);
+    const segLen = Math.hypot(pt.x - prev.x, pt.y - prev.y);
+    accumulated += segLen;
+    if (accumulated >= targetLen) {
+      // Interpolate back for precision
+      const overshoot = accumulated - targetLen;
+      const frac = segLen > 0 ? overshoot / segLen : 0;
+      return (i - frac) / segments;
+    }
+    prev = pt;
+  }
+  return 1;
+}
+
 export function setupStretchDrag(opts: StretchDragOptions): void {
   const {
     element,
@@ -65,11 +124,21 @@ export function setupStretchDrag(opts: StretchDragOptions): void {
     pullText = element.dataset.word || element.textContent || '';
   }
 
+  // Split into individual characters
+  const chars = Array.from(pullText);
+
   // Compute font style from the element
   const cs = window.getComputedStyle(element);
   const fontSize = parseFloat(cs.fontSize) || 16;
   const fontFamily = cs.fontFamily;
   const fontWeight = cs.fontWeight;
+
+  // Measure individual character widths using a hidden canvas
+  const measureCanvas = document.createElement('canvas');
+  const mCtx = measureCanvas.getContext('2d')!;
+  mCtx.font = `${fontWeight} ${fontSize}px ${fontFamily}`;
+  const charWidths = chars.map((ch) => mCtx.measureText(ch).width);
+  const naturalTextWidth = charWidths.reduce((a, b) => a + b, 0);
 
   // Anchor side: the end FARTHER from the mouse stays tethered
   const distToLeft = Math.abs(mouseX - rect.left);
@@ -82,14 +151,11 @@ export function setupStretchDrag(opts: StretchDragOptions): void {
 
   let moved = false;
 
-  // ── SVG state ────────────────────────────────────────────────
+  // ── Overlay state ──────────────────────────────────────────────
+  let container: HTMLDivElement | null = null;
   let svgOverlay: SVGSVGElement | null = null;
-  let curvePath: SVGPathElement | null = null;
-  let textPathEl: SVGTextPathElement | null = null;
-  let textEl: SVGTextElement | null = null;
-  // Thin stroke underneath the text so the "string" is visible even
-  // when the text is very spread out
   let strokePath: SVGPathElement | null = null;
+  let letterEls: HTMLSpanElement[] = [];
 
   // Physics state
   let controlY: number | null = null;
@@ -101,54 +167,61 @@ export function setupStretchDrag(opts: StretchDragOptions): void {
   let curMouseX = mouseX;
   let curMouseY = mouseY;
 
-  // ── Create the SVG overlay ─────────────────────────────────────
+  // Current bezier control point (for squish/snapback animations)
+  let curCtrlX = anchorX;
+  let curCtrlY = anchorY;
+
+  // ── Create the overlay ─────────────────────────────────────────
   const createOverlay = () => {
     const vw = window.innerWidth;
     const vh = window.innerHeight;
 
-    svgOverlay = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svgOverlay.style.cssText = `
+    // Container div for everything
+    container = document.createElement('div');
+    container.style.cssText = `
       position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
       z-index: 9999; pointer-events: none; overflow: visible;
     `;
+
+    // SVG for the thin string stroke
+    svgOverlay = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svgOverlay.style.cssText = `
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      overflow: visible;
+    `;
     svgOverlay.setAttribute('viewBox', `0 0 ${vw} ${vh}`);
 
-    // Defs: the bezier path that text flows along
-    const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
-    curvePath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    curvePath.setAttribute('id', 'stretch-drag-curve');
-    curvePath.setAttribute('d', `M ${anchorX} ${anchorY} L ${anchorX} ${anchorY}`);
-    defs.appendChild(curvePath);
-    svgOverlay.appendChild(defs);
-
-    // Thin string stroke (visible when text is spread thin)
     strokePath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
     strokePath.setAttribute('fill', 'none');
     strokePath.setAttribute('stroke', accentColor);
-    strokePath.setAttribute('stroke-width', '1');
+    strokePath.setAttribute('stroke-width', '1.5');
     strokePath.setAttribute('stroke-linecap', 'round');
-    strokePath.setAttribute('opacity', '0');
+    strokePath.setAttribute('opacity', '0.5');
     svgOverlay.appendChild(strokePath);
 
-    // Text along the path
-    textEl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-    textEl.setAttribute('font-size', String(fontSize));
-    textEl.setAttribute('font-family', fontFamily);
-    textEl.setAttribute('font-weight', fontWeight);
-    textEl.setAttribute('fill', '#374151');
-    textEl.style.userSelect = 'none';
+    container.appendChild(svgOverlay);
 
-    textPathEl = document.createElementNS('http://www.w3.org/2000/svg', 'textPath');
-    textPathEl.setAttribute('href', '#stretch-drag-curve');
-    // Text starts from anchor side
-    textPathEl.setAttribute('startOffset', anchorSide === 'left' ? '0%' : '100%');
-    textPathEl.setAttribute('text-anchor', anchorSide === 'left' ? 'start' : 'end');
-    textPathEl.textContent = pullText;
+    // Create individual letter spans
+    letterEls = chars.map((ch) => {
+      const span = document.createElement('span');
+      span.textContent = ch;
+      span.style.cssText = `
+        position: absolute;
+        font-size: ${fontSize}px;
+        font-family: ${fontFamily};
+        font-weight: ${fontWeight};
+        color: #374151;
+        pointer-events: none;
+        user-select: none;
+        will-change: transform;
+        white-space: pre;
+        transform-origin: center center;
+      `;
+      container!.appendChild(span);
+      return span;
+    });
 
-    textEl.appendChild(textPathEl);
-    svgOverlay.appendChild(textEl);
-
-    document.body.appendChild(svgOverlay);
+    document.body.appendChild(container);
 
     // Dim the original
     element.style.opacity = '0.15';
@@ -163,19 +236,80 @@ export function setupStretchDrag(opts: StretchDragOptions): void {
     startPhysicsLoop();
   };
 
+  // ── Position letters along the bezier ──────────────────────────
+  const layoutLetters = (
+    ax: number, ay: number,
+    cx: number, cy: number,
+    bx: number, by: number,
+    pathLen: number,
+    opacity?: number,
+    scale?: number,
+  ) => {
+    if (letterEls.length === 0) return;
+
+    const n = chars.length;
+    // Compute spacing: distribute letters evenly along the curve
+    // with extra spacing proportional to stretch
+    const stretchRatio = pathLen / Math.max(naturalTextWidth, 1);
+
+    // Each character gets its natural width + proportional extra space
+    const totalExtra = Math.max(0, pathLen - naturalTextWidth);
+    const gaps = Math.max(n - 1, 1);
+    const extraPerGap = totalExtra / gaps;
+
+    // Compute cumulative positions (center of each char) along the path
+    let accumulated = 0;
+    const charPositions: number[] = [];
+
+    // If anchor is on the right, we reverse the order
+    const isReversed = anchorSide === 'right';
+
+    for (let i = 0; i < n; i++) {
+      const idx = isReversed ? n - 1 - i : i;
+      const w = charWidths[idx];
+      charPositions[idx] = accumulated + w / 2;
+      accumulated += w + (i < n - 1 ? extraPerGap : 0);
+    }
+
+    // Scale positions to fit within pathLen
+    const totalSpan = accumulated;
+    const posScale = totalSpan > 0 ? pathLen / totalSpan : 1;
+
+    // Vertical squish: letters flatten as string stretches
+    const squishY = 1 / Math.max(1, Math.pow(stretchRatio, 0.5));
+    // Horizontal squish: letters compress slightly as they spread
+    const squishX = 1 / Math.max(1, Math.pow(stretchRatio, 0.25));
+
+    const effectiveScale = scale ?? 1;
+    const effectiveOpacity = opacity ?? Math.max(0.2, Math.min(1, 2 / stretchRatio));
+
+    for (let i = 0; i < n; i++) {
+      const el = letterEls[i];
+      const pos = charPositions[i] * posScale;
+      const t = tAtArcLength(ax, ay, cx, cy, bx, by, pos);
+      const pt = quadBezierPoint(ax, ay, cx, cy, bx, by, t);
+
+      const sx = squishX * effectiveScale;
+      const sy = squishY * effectiveScale;
+
+      el.style.transform = `translate(${pt.x - charWidths[i] / 2}px, ${pt.y - fontSize / 2}px) scale(${sx}, ${sy})`;
+      el.style.opacity = String(effectiveOpacity);
+    }
+  };
+
   // ── Physics loop ───────────────────────────────────────────────
   const startPhysicsLoop = () => {
     const simulate = (time: number) => {
       const dt = Math.min((time - lastTime) / 1000, 0.04);
       lastTime = time;
 
-      if (!curvePath || !strokePath || !textEl) return;
+      if (!strokePath) return;
 
       const dx = curMouseX - anchorX;
       const dy = curMouseY - anchorY;
       const distance = Math.hypot(dx, dy);
 
-      // Droop: taut string — much less sag than canvas StringEdge
+      // Droop: taut string — less sag than canvas StringEdge
       const droop = Math.min(distance * 0.06, 25);
       const midX = (anchorX + curMouseX) / 2;
       const restY = Math.max(anchorY, curMouseY) + droop;
@@ -191,46 +325,18 @@ export function setupStretchDrag(opts: StretchDragOptions): void {
       velX += (-X_STIFFNESS * controlXOffset - X_DAMPING * velX) * dt;
       controlXOffset += velX * dt;
 
-      const ctrlX = midX + controlXOffset;
-      const ctrlY = controlY;
+      curCtrlX = midX + controlXOffset;
+      curCtrlY = controlY;
 
-      // Update the bezier path
-      const d = `M ${anchorX} ${anchorY} Q ${ctrlX} ${ctrlY} ${curMouseX} ${curMouseY}`;
-      curvePath.setAttribute('d', d);
+      // Update the bezier stroke path
+      const d = `M ${anchorX} ${anchorY} Q ${curCtrlX} ${curCtrlY} ${curMouseX} ${curMouseY}`;
       strokePath.setAttribute('d', d);
 
-      // Measure the path length to compute text spacing
-      const pathLen = curvePath.getTotalLength();
+      // Compute path length
+      const pathLen = quadBezierLength(anchorX, anchorY, curCtrlX, curCtrlY, curMouseX, curMouseY);
 
-      // Approximate the text's natural width (rough: chars * fontSize * 0.55)
-      const naturalTextWidth = pullText.length * fontSize * 0.55;
-
-      // Stretch ratio: how much longer the path is than the text's natural width
-      const stretchRatio = pathLen / Math.max(naturalTextWidth, 1);
-
-      // Text opacity fades as stretch increases
-      const textOpacity = Math.max(0.15, Math.min(1, 1.8 / stretchRatio));
-      textEl.setAttribute('opacity', String(textOpacity));
-
-      // Stroke stays invisible during drag — only appears in squish animation
-      // (just keep its `d` updated above so it has the right shape)
-
-      // Vertical squish: font shrinks as the word stretches along the curve,
-      // like taffy being pulled thin. Kicks in immediately (stretchRatio > 1)
-      // and gets aggressive fast — short words thin out quickly.
-      const squish = 1 / Math.max(1, Math.pow(stretchRatio, 0.8));
-      textEl.setAttribute('font-size', String(fontSize * Math.max(0.15, squish)));
-
-      // Minimal letter-spacing: only for long text (sentences) to avoid
-      // excessive bunching. Short words (< 15 chars) get zero spacing so
-      // they stay cohesive. Longer text gets a small amount to breathe.
-      if (pullText.length >= 15 && stretchRatio > 1.5) {
-        const extraPerChar = (pathLen - naturalTextWidth) / Math.max(pullText.length - 1, 1);
-        // Cap at a small fraction of font-size so letters never fully separate
-        textEl.setAttribute('letter-spacing', String(Math.min(extraPerChar, fontSize * 0.4)));
-      } else {
-        textEl.setAttribute('letter-spacing', '0');
-      }
+      // Layout letters along the curve
+      layoutLetters(anchorX, anchorY, curCtrlX, curCtrlY, curMouseX, curMouseY, pathLen);
 
       rafId = requestAnimationFrame(simulate);
     };
@@ -256,14 +362,13 @@ export function setupStretchDrag(opts: StretchDragOptions): void {
       cancelAnimationFrame(rafId);
       rafId = null;
     }
-    if (svgOverlay?.parentNode) {
-      svgOverlay.parentNode.removeChild(svgOverlay);
+    if (container?.parentNode) {
+      container.parentNode.removeChild(container);
     }
+    container = null;
     svgOverlay = null;
-    curvePath = null;
-    textPathEl = null;
-    textEl = null;
     strokePath = null;
+    letterEls = [];
   };
 
   const restoreOriginal = () => {
@@ -277,12 +382,10 @@ export function setupStretchDrag(opts: StretchDragOptions): void {
   };
 
   // ── Squish-to-string animation on release ──────────────────────
-  // The text compresses along the curve: letter-spacing → 0, font shrinks,
-  // text fades out while the thin stroke line strengthens — the text
-  // visually becomes a plain string, then onComplete spawns the node
-  // whose StringEdge draw-on animation picks up from there.
+  // Letters shrink and fade while the string stroke strengthens,
+  // then onComplete spawns the node whose StringEdge picks up.
   const squishToString = (duration: number, cb: () => void) => {
-    if (!svgOverlay || !textEl || !strokePath || !curvePath) {
+    if (!container || !strokePath) {
       cb();
       return;
     }
@@ -293,48 +396,37 @@ export function setupStretchDrag(opts: StretchDragOptions): void {
       rafId = null;
     }
 
-    // Capture current state
-    const startFontSize = parseFloat(textEl.getAttribute('font-size') || String(fontSize));
-    const startLetterSpacing = parseFloat(textEl.getAttribute('letter-spacing') || '0');
-    const startTextOpacity = parseFloat(textEl.getAttribute('opacity') || '1');
-    const startStrokeOpacity = parseFloat(strokePath.getAttribute('opacity') || '0');
-    const startStrokeWidth = parseFloat(strokePath.getAttribute('stroke-width') || '1');
+    const startStrokeOpacity = parseFloat(strokePath.getAttribute('opacity') || '0.5');
     const startTime = performance.now();
+    const pathLen = quadBezierLength(anchorX, anchorY, curCtrlX, curCtrlY, curMouseX, curMouseY);
 
     const animate = (time: number) => {
       const elapsed = time - startTime;
       const t = Math.min(elapsed / duration, 1);
-      // Ease in-out cubic for smooth squish
+      // Ease in-out cubic
       const ease = t < 0.5
         ? 4 * t * t * t
         : 1 - Math.pow(-2 * t + 2, 3) / 2;
 
-      if (!textEl || !strokePath) return;
+      if (!strokePath) return;
 
-      // Collapse letter-spacing to 0
-      const ls = startLetterSpacing * (1 - ease);
-      textEl.setAttribute('letter-spacing', String(ls));
+      // Letters shrink and fade
+      const scale = Math.max(0.05, 1 - ease * 0.95);
+      const opacity = Math.max(0, 1 - ease * 1.5);
+      layoutLetters(
+        anchorX, anchorY, curCtrlX, curCtrlY, curMouseX, curMouseY,
+        pathLen, opacity, scale,
+      );
 
-      // Shrink font toward a thin line
-      const fs = startFontSize * Math.max(0.08, 1 - ease * 0.92);
-      textEl.setAttribute('font-size', String(fs));
-
-      // Fade text out
-      const textOp = startTextOpacity * Math.max(0, 1 - ease * 1.5);
-      textEl.setAttribute('opacity', String(textOp));
-
-      // Strengthen the stroke line — the "string" emerges
-      const strokeOp = startStrokeOpacity + (0.6 - startStrokeOpacity) * ease;
+      // Strengthen the stroke line
+      const strokeOp = startStrokeOpacity + (0.7 - startStrokeOpacity) * ease;
       strokePath.setAttribute('opacity', String(strokeOp));
-
-      // Thicken stroke slightly as text vanishes
-      const sw = startStrokeWidth + (1.5 - startStrokeWidth) * ease;
-      strokePath.setAttribute('stroke-width', String(sw));
+      strokePath.setAttribute('stroke-width', String(1.5 + ease));
 
       if (t < 1) {
         requestAnimationFrame(animate);
       } else {
-        // Quick fade of the remaining stroke line
+        // Quick fade of the remaining stroke
         const fadeStart = performance.now();
         const fadeDuration = 120;
         const finalStrokeOp = strokeOp;
@@ -357,7 +449,7 @@ export function setupStretchDrag(opts: StretchDragOptions): void {
 
   // ── Snap-back animation on cancel ──────────────────────────────
   const snapBack = (duration: number, cb: () => void) => {
-    if (!curvePath || !svgOverlay) {
+    if (!container || !strokePath) {
       removeOverlay();
       cb();
       return;
@@ -387,12 +479,14 @@ export function setupStretchDrag(opts: StretchDragOptions): void {
       const cx = (anchorX + mx) / 2 + startCtrlXOff * (1 - ease);
 
       const d = `M ${anchorX} ${anchorY} Q ${cx} ${cy} ${mx} ${my}`;
-      curvePath!.setAttribute('d', d);
-      strokePath?.setAttribute('d', d);
+      strokePath!.setAttribute('d', d);
 
-      // Fade in the original, fade out the SVG
+      const pathLen = quadBezierLength(anchorX, anchorY, cx, cy, mx, my);
+      layoutLetters(anchorX, anchorY, cx, cy, mx, my, pathLen);
+
+      // Fade in the original, fade out the overlay
       element.style.opacity = String(ease);
-      svgOverlay!.style.opacity = String(1 - ease * 0.5);
+      container!.style.opacity = String(1 - ease * 0.5);
 
       if (t < 1) {
         requestAnimationFrame(animate);
